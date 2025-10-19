@@ -1,73 +1,367 @@
-####load libraries ########  
+# ==============================================================================
+# TCGA Prostate Cancer RNA-Seq Data Loading and Preprocessing 
+# ==============================================================================
+
+# Load Required Libraries ------------------------------------------------------
 library(readr)
 library(TCGAbiolinks)
 library(DESeq2)
 library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+
+# ==============================================================================
+# 1. QUERY AND DOWNLOAD TCGA-PRAD DATA
+# ==============================================================================
+
+download_tcga_data <- function(save_query = TRUE) {
+  cat("=" , rep("=", 70), "\n", sep = "")
+  cat("STEP 1: Querying TCGA-PRAD RNA-Seq Data\n")
+  cat(rep("=", 70), "\n\n", sep = "")
+  
+  # Build query
+  gdc_query <- GDCquery(
+    project = "TCGA-PRAD",
+    data.category = "Transcriptome Profiling",
+    experimental.strategy = "RNA-Seq",
+    workflow.type = "STAR - Counts",
+    access = "open"
+  )
+  
+  # Save query object
+  if (save_query) {
+    saveRDS(gdc_query, file = "data/GDCquery.rds")
+    cat("Query object saved to: data/GDCquery.rds\n")
+  }
+  
+  # Get query results summary
+  results <- getResults(gdc_query)
+  cat("\nQuery Results Summary:\n")
+  cat("Total samples:", nrow(results), "\n")
+  cat("Sample types:", paste(unique(results$sample_type), collapse = ", "), "\n\n")
+  
+  # Download data
+  cat("Downloading data...\n")
+  GDCdownload(gdc_query)
+  cat("Download complete!\n\n")
+  
+  return(gdc_query)
+}
+
+# Execute download 
+if (!file.exists("data/GDCquery.rds")) {
+  dir.create("data", showWarnings = FALSE, recursive = TRUE)
+  gdc_query <- download_tcga_data(save_query = TRUE)
+} else {
+  cat("Loading existing query...\n")
+  gdc_query <- readRDS("data/GDCquery.rds")
+}
 
 
+# ==============================================================================
+# 2. PREPARE AND EXTRACT DATA
+# ==============================================================================
 
-#########loading prostate caner RNA-Seq from TCGA data base###########
+prepare_tcga_data <- function(query) {
 
+  # Prepare data as SummarizedExperiment
+  cat("Loading and preparing data...\n")
+  tcga_data <- GDCprepare(query, summarizedExperiment = TRUE)
+  
+  # Extract components
+  data_matrix <- assay(tcga_data, "unstranded")
+  row_data <- rowData(tcga_data)
+  col_data <- colData(tcga_data)
+  
+  cat("Data dimensions:\n")
+  cat("  Genes/Features:", nrow(data_matrix), "\n")
+  cat("  Samples:", ncol(data_matrix), "\n\n")
+  
+  cat("Sample type distribution:\n")
+  print(table(col_data$sample_type))
+  cat("\n")
+  
+  return(list(
+    data = tcga_data,
+    matrix = data_matrix,
+    rowData = row_data,
+    colData = col_data
+  ))
+}
 
-##building query data
-
-gdc_query = GDCquery(
-  project = "TCGA-PRAD",
-  data.category = 'Transcriptome Profiling',
-  experimental.strategy = 'RNA-Seq',
-  workflow.type = 'STAR - Counts',
-  access = 'open')
-
-save(gdc_query ,file = "GDCquery")
-
-results<- getResults(gdc_query)
-
-
-#downlaod the data 
-
-GDCdownload(gdc_query)
-
-#prepare the data
-
-TCGA_data <- GDCprepare(gdc_query, summarizedExperiment = TRUE)
-
-data_matrix <- assay(TCGA_data, 'unstranded')
-
-rowData <- rowData(TCGA_data)
-
-colData <-  colData(TCGA_data)
-
-
-
-#considering protein coding gene only 
-protein_coding = rownames(as.data.frame(rowData) %>% filter(., gene_type =='protein_coding' ))
-exp_matrix <- data_matrix[protein_coding,]
+# Prepare data
+tcga_prepared <- prepare_tcga_data(gdc_query)
 
 
-####### Data filteration ####################################
+# ==============================================================================
+# 3. FILTER FOR PROTEIN-CODING GENES
+# ==============================================================================
 
-# check duplciation
-x=duplicated(rowData[rownames(exp_matrix),]$gene_name) 
-sum(x)
+filter_protein_coding <- function(data_matrix, row_data) {
 
-#aggregation of duplicated genes
+  # Get protein-coding genes
+  row_data_df <- as.data.frame(row_data)
+  protein_coding_ids <- rownames(row_data_df[row_data_df$gene_type == "protein_coding", ])
+  
+  # Filter expression matrix
+  exp_matrix <- data_matrix[protein_coding_ids, ]
+  
+  cat("Filtering results:\n")
+  cat("  Total genes (before):", nrow(data_matrix), "\n")
+  cat("  Protein-coding genes (after):", nrow(exp_matrix), "\n")
+  cat("  Genes removed:", nrow(data_matrix) - nrow(exp_matrix), "\n\n")
+  
+  return(exp_matrix)
+}
 
-rownames(exp_matrix) <- rowData[rownames(exp_matrix),]$gene_name
-exp_matrix_agg= aggregate(exp_matrix, list(rownames(exp_matrix)),FUN=max)
-genes=exp_matrix_agg$Group.1
-exp_matrix_agg=exp_matrix_agg[-1]
-exp_matrix_agg=apply(exp_matrix_agg,2, as.numeric)
-exp_matrix_agg=round(exp_matrix_agg)
-rownames(exp_matrix_agg)=genes
+# Filter for protein-coding genes
+exp_matrix <- filter_protein_coding(tcga_prepared$matrix, tcga_prepared$rowData)
 
 
+# ==============================================================================
+# 4. HANDLE DUPLICATE GENE NAMES
+# ==============================================================================
 
-# Calculate total read counts per gene/transcript
-total_counts <- rowSums(exp_matrix_agg)
+handle_duplicates <- function(exp_matrix, row_data, method = "max") {
 
-# Set a threshold for minimum read counts (adjust as needed)
-min_counts_threshold <- 100
+  # Map Ensembl IDs to gene names
+  gene_names <- row_data[rownames(exp_matrix), ]$gene_name
+  
+  # Check for duplicates
+  duplicated_genes <- duplicated(gene_names)
+  n_duplicates <- sum(duplicated_genes)
+  
+  cat("Duplicate gene names found:", n_duplicates, "\n")
+  
+  if (n_duplicates > 0) {
+    # Show some duplicate examples
+    dup_examples <- names(table(gene_names[duplicated(gene_names) | duplicated(gene_names, fromLast = TRUE)]))[1:min(5, n_duplicates)]
+    cat("Example duplicates:", paste(dup_examples, collapse = ", "), "\n\n")
+    
+    # Assign gene names as rownames
+    rownames(exp_matrix) <- gene_names
+    
+    # Aggregate duplicates
+    cat("Aggregating duplicates using method:", method, "\n")
+    
+    if (method == "max") {
+      exp_matrix_agg <- aggregate(exp_matrix, list(rownames(exp_matrix)), FUN = max)
+    } else if (method == "mean") {
+      exp_matrix_agg <- aggregate(exp_matrix, list(rownames(exp_matrix)), FUN = mean)
+    } else if (method == "sum") {
+      exp_matrix_agg <- aggregate(exp_matrix, list(rownames(exp_matrix)), FUN = sum)
+    }
+    
+    # Extract gene names and prepare matrix
+    genes <- exp_matrix_agg$Group.1
+    exp_matrix_agg <- exp_matrix_agg[, -1]
+    
+    # Convert to numeric and round (for count data)
+    exp_matrix_agg <- apply(exp_matrix_agg, 2, as.numeric)
+    exp_matrix_agg <- round(exp_matrix_agg)
+    rownames(exp_matrix_agg) <- genes
+    
+    cat("After aggregation:\n")
+    cat("  Unique genes:", nrow(exp_matrix_agg), "\n\n")
+  } else {
+    cat("No duplicates found, proceeding without aggregation.\n\n")
+    rownames(exp_matrix) <- gene_names
+    exp_matrix_agg <- exp_matrix
+  }
+  
+  return(exp_matrix_agg)
+}
 
-# Filter genes/transcripts based on minimum read counts
-filtered_data <- ex_matrix_agg[total_counts >= min_counts_threshold, ]
+# Handle duplicate gene names
+exp_matrix_agg <- handle_duplicates(exp_matrix, tcga_prepared$rowData, method = "max")
+
+
+# ==============================================================================
+# 5. FILTER LOW-COUNT GENES
+# ==============================================================================
+
+filter_low_counts <- function(exp_matrix, min_counts = 100, min_samples = 10) {
+
+  cat("Filtering criteria:\n")
+  cat("  Minimum total counts:", min_counts, "\n")
+  cat("  OR minimum samples with >0 counts:", min_samples, "\n\n")
+  
+  # Calculate total read counts per gene
+  total_counts <- rowSums(exp_matrix)
+  
+  # Calculate number of samples with non-zero counts
+  samples_with_counts <- rowSums(exp_matrix > 0)
+  
+  # Filter: Keep genes with either sufficient total counts OR expressed in enough samples
+  keep <- (total_counts >= min_counts) | (samples_with_counts >= min_samples)
+  
+  filtered_data <- exp_matrix[keep, ]
+  
+  cat("Filtering results:\n")
+  cat("  Genes before filtering:", nrow(exp_matrix), "\n")
+  cat("  Genes after filtering:", nrow(filtered_data), "\n")
+  cat("  Genes removed:", sum(!keep), "\n")
+  cat("  Percentage retained:", round(100 * mean(keep), 2), "%\n\n")
+  
+  # Show distribution of counts
+  cat("Count distribution summary:\n")
+  cat("  Min total counts:", min(total_counts[keep]), "\n")
+  cat("  Median total counts:", median(total_counts[keep]), "\n")
+  cat("  Max total counts:", max(total_counts[keep]), "\n\n")
+  
+  return(filtered_data)
+}
+
+# Filter low-count genes
+filtered_data <- filter_low_counts(exp_matrix_agg, min_counts = 100, min_samples = 10)
+
+
+# ==============================================================================
+# 6. QUALITY CONTROL VISUALIZATIONS
+# ==============================================================================
+
+plot_qc_metrics <- function(filtered_data, col_data, output_dir = "plots") {
+
+  
+  # Create output directory
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # 1. Library size distribution
+  library_sizes <- colSums(filtered_data)
+  df_lib <- data.frame(
+    Sample = colnames(filtered_data),
+    LibrarySize = library_sizes,
+    SampleType = col_data$sample_type
+  )
+  
+  p1 <- ggplot(df_lib, aes(x = SampleType, y = LibrarySize/1e6, fill = SampleType)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(title = "Library Size Distribution by Sample Type",
+         y = "Library Size (Millions)",
+         x = "Sample Type") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  ggsave(file.path(output_dir, "library_size_distribution.png"), p1, width = 8, height = 6)
+  print(p1)
+  
+  # 2. Gene count distribution
+  gene_counts <- rowSums(filtered_data)
+  p2 <- ggplot(data.frame(TotalCounts = gene_counts), aes(x = log10(TotalCounts + 1))) +
+    geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+    theme_minimal() +
+    labs(title = "Gene Expression Distribution (log10 scale)",
+         x = "log10(Total Counts + 1)",
+         y = "Number of Genes")
+  
+  ggsave(file.path(output_dir, "gene_count_distribution.png"), p2, width = 8, height = 6)
+  print(p2)
+  
+  # 3. Sample correlation heatmap (on subset for visualization)
+  set.seed(123)
+  sample_subset <- sample(1:ncol(filtered_data), min(50, ncol(filtered_data)))
+  cor_matrix <- cor(log2(filtered_data[, sample_subset] + 1))
+  
+  library(pheatmap)
+  png(file.path(output_dir, "sample_correlation_heatmap.png"), width = 800, height = 800)
+  pheatmap(cor_matrix,
+           main = "Sample Correlation Heatmap (log2 transformed)",
+           show_rownames = FALSE,
+           show_colnames = FALSE)
+  dev.off()
+  
+  cat("Quality control plots saved to:", output_dir, "\n\n")
+}
+
+# Generate QC plots
+plot_qc_metrics(filtered_data, tcga_prepared$colData)
+
+
+# ==============================================================================
+# 7. SAVE PROCESSED DATA
+# ==============================================================================
+
+save_processed_data <- function(filtered_data, col_data, output_dir = "data") {
+  
+  # Create output directory
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save expression matrix
+  saveRDS(filtered_data, file.path(output_dir, "filtered_expression_matrix.rds"))
+  write.csv(filtered_data, file.path(output_dir, "filtered_expression_matrix.csv"))
+  
+  # Save metadata
+  saveRDS(col_data, file.path(output_dir, "sample_metadata.rds"))
+  write.csv(as.data.frame(col_data), file.path(output_dir, "sample_metadata.csv"))
+  
+  # Save summary statistics
+  summary_stats <- data.frame(
+    Total_Genes = nrow(filtered_data),
+    Total_Samples = ncol(filtered_data),
+    Primary_Tumor = sum(col_data$sample_type == "Primary Tumor"),
+    Normal_Tissue = sum(col_data$sample_type == "Solid Tissue Normal"),
+    Median_Library_Size = median(colSums(filtered_data)),
+    Mean_Library_Size = mean(colSums(filtered_data))
+  )
+  
+  write.csv(summary_stats, file.path(output_dir, "summary_statistics.csv"), row.names = FALSE)
+  
+  cat("Processed data saved:\n")
+  cat("  Expression matrix:", file.path(output_dir, "filtered_expression_matrix.rds"), "\n")
+  cat("  Sample metadata:", file.path(output_dir, "sample_metadata.rds"), "\n")
+  cat("  Summary statistics:", file.path(output_dir, "summary_statistics.csv"), "\n\n")
+  
+  return(summary_stats)
+}
+
+# Save processed data
+summary_stats <- save_processed_data(filtered_data, tcga_prepared$colData)
+
+
+# ==============================================================================
+# 8. PREPARE FOR DIFFERENTIAL EXPRESSION ANALYSIS
+# ==============================================================================
+
+prepare_for_deseq2 <- function(count_matrix, col_data, 
+                               tumor_type = "Primary Tumor",
+                               normal_type = "Solid Tissue Normal") {
+  cat(rep("=", 70), "\n", sep = "")
+  cat("STEP 8: Preparing Data for DESeq2 Analysis\n")
+  cat(rep("=", 70), "\n\n", sep = "")
+  
+  # Filter samples to include only tumor and normal
+  samples_to_keep <- col_data$sample_type %in% c(tumor_type, normal_type)
+  
+  count_matrix_subset <- count_matrix[, samples_to_keep]
+  col_data_subset <- col_data[samples_to_keep, ]
+  
+  # Create sample type factor
+  col_data_subset$sample_type <- factor(
+    col_data_subset$sample_type,
+    levels = c(normal_type, tumor_type)
+  )
+  
+  cat("DESeq2 dataset summary:\n")
+  cat("  Genes:", nrow(count_matrix_subset), "\n")
+  cat("  Normal samples:", sum(col_data_subset$sample_type == normal_type), "\n")
+  cat("  Tumor samples:", sum(col_data_subset$sample_type == tumor_type), "\n\n")
+  
+  # Create DESeq2 dataset
+  dds <- DESeqDataSetFromMatrix(
+    countData = count_matrix_subset,
+    colData = col_data_subset,
+    design = ~ sample_type
+  )
+  
+  cat("DESeq2 dataset created successfully!\n")
+  cat("Ready for differential expression analysis.\n\n")
+  
+  return(dds)
+}
+
+# Prepare DESeq2 dataset
+dds <- prepare_for_deseq2(filtered_data, tcga_prepared$colData)
+
+
 
