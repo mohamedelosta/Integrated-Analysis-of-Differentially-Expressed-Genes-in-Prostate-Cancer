@@ -10,34 +10,16 @@ library(dplyr)
 # Set seed for reproducibility
 set.seed(123)
 
-# ==============================================================================
-# 1. DATA PREPARATION
-# ==============================================================================
 
-prepare_data <- function(degs_exp, col_data) {
-  # Transpose expression data and add class labels
-  deg_train <- as.data.frame(t(degs_exp))
-  deg_train$class <- factor(make.names(col_data$sample_type))
-  
-  # Check for missing values
-  if(any(is.na(deg_train))) {
-    warning("Missing values detected. Consider imputation.")
-  }
-  
-  return(deg_train)
-}
+# 1. DATA PREPARATION ==============================================================================
 
-# Prepare the dataset
-deg_train <- prepare_data(degs.exp, colData)
-
-cat("Dataset dimensions:", dim(deg_train), "\n")
-cat("Class distribution:\n")
-print(table(deg_train$class))
+# Transpose expression data and add class labels
+deg_train <- as.data.frame(t(degs_exp))
+deg_train$class <- factor(make.names(col_data$sample_type))
 
 
-# ==============================================================================
-# 2. DATA SPLITTING
-# ==============================================================================
+
+# 2. DATA SPLITTING ==============================================================================
 
 split_data <- function(data, train_prop = 0.7, test_prop = 0.2, val_prop = 0.1) {
   # Validate proportions
@@ -72,41 +54,30 @@ test <- data_splits$test
 validation <- data_splits$validation
 
 
-# ==============================================================================
-# 3. TRADITIONAL MACHINE LEARNING MODELS
-# ==============================================================================
+# 3. TRADITIONAL MACHINE LEARNING ==============================================================================
 
-train_ml_models <- function(train_data, algorithms = c('rf', 'svmRadial')) {
-  # Define training control
-  train_control <- trainControl(
-    method = "repeatedcv",
-    number = 10,
-    repeats = 3,
-    classProbs = TRUE,
-    summaryFunction = twoClassSummary,
-    savePredictions = "final",
-    verboseIter = FALSE
-  )
+# Define training control
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+
   
-  cat("\nTraining models:", paste(algorithms, collapse = ", "), "\n")
-  
-  # Train models
-  models <- caretList(
-    class ~ .,
-    data = train_data,
-    methodList = algorithms,
-    trControl = train_control,
-    metric = "ROC"
-  )
-  
-  return(models)
-}
+# Train models
+models <- caretList(
+  class ~ .,
+  data = train_data,
+  methodList = algorithms,
+  trControl = train_control,
+  metric = "ROC"
+)
 
 # Train RF and SVM models
-cat("\n" , rep("=", 50), "\n", sep = "")
-cat("TRAINING TRADITIONAL ML MODELS\n")
-cat(rep("=", 50), "\n", sep = "")
-
 ml_models <- train_ml_models(train, algorithms = c('rf', 'svmRadial'))
 
 # Display model performance
@@ -114,106 +85,67 @@ resamples_results <- resamples(ml_models)
 summary(resamples_results)
 
 
-# ==============================================================================
-# 4. XGBOOST MODEL
-# ==============================================================================
 
-train_xgboost <- function(train_data, test_data, nrounds = 100, max_depth = 6, 
-                         eta = 0.3, early_stopping_rounds = 10) {
+# 4. XGBOOST MODEL ==============================================================================
+
   
-  cat("\n", rep("=", 50), "\n", sep = "")
-  cat("TRAINING XGBOOST MODEL\n")
-  cat(rep("=", 50), "\n", sep = "")
+# Prepare data for XGBoost
+train_matrix <- as.matrix(train_data[, -ncol(train_data)])
+train_label <- as.numeric(train_data$class) - 1  # Convert to 0/1
   
-  # Prepare data for XGBoost
-  train_matrix <- as.matrix(train_data[, -ncol(train_data)])
-  train_label <- as.numeric(train_data$class) - 1  # Convert to 0/1
+test_matrix <- as.matrix(test_data[, -ncol(test_data)])
+test_label <- as.numeric(test_data$class) - 1
   
-  test_matrix <- as.matrix(test_data[, -ncol(test_data)])
-  test_label <- as.numeric(test_data$class) - 1
+# Create DMatrix objects
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
   
-  # Create DMatrix objects
-  dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
-  dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
   
-  # Set parameters
-  params <- list(
-    objective = "binary:logistic",
-    eval_metric = "auc",
-    max_depth = max_depth,
-    eta = eta,
-    subsample = 0.8,
-    colsample_bytree = 0.8
-  )
+# Train with cross-validation to find optimal rounds
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nfold = 5,
+  verbose = 0
+)
   
-  # Train with cross-validation to find optimal rounds
-  cv_results <- xgb.cv(
-    params = params,
-    data = dtrain,
-    nrounds = nrounds,
-    nfold = 5,
-    early_stopping_rounds = early_stopping_rounds,
-    verbose = 0
-  )
-  
-  best_iteration <- cv_results$best_iteration
-  cat("Best iteration:", best_iteration, "\n")
+best_iteration <- cv_results$best_iteration
+
   
   # Train final model
-  xgb_model <- xgb.train(
-    params = params,
-    data = dtrain,
-    nrounds = best_iteration,
-    watchlist = list(train = dtrain, test = dtest),
-    verbose = 0
-  )
-  
-  return(xgb_model)
-}
+xgb_model <- xgb.train(
+  data = dtrain,
+  nrounds = best_iteration,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose = 0
+)
 
 # Train XGBoost
 xgb_model <- train_xgboost(train, test, nrounds = 100, max_depth = 6)
 
 
-# ==============================================================================
-# 5. PREDICTIONS
-# ==============================================================================
 
-make_predictions <- function(models, xgb_model, test_data) {
-  cat("\n", rep("=", 50), "\n", sep = "")
-  cat("MAKING PREDICTIONS\n")
-  cat(rep("=", 50), "\n", sep = "")
+# 5. PREDICTIONS ==============================================================================
+
+# Traditional ML predictions (probabilities)
+pred_rf <- predict(models$rf, newdata = test_data, type = "prob")[, 2]
+pred_svm <- predict(models$svmRadial, newdata = test_data, type = "prob")[, 2]
   
-  # Traditional ML predictions (probabilities)
-  pred_rf <- predict(models$rf, newdata = test_data, type = "prob")[, 2]
-  pred_svm <- predict(models$svmRadial, newdata = test_data, type = "prob")[, 2]
-  
-  # XGBoost predictions
-  test_matrix <- as.matrix(test_data[, -ncol(test_data)])
-  pred_xgb <- predict(xgb_model, test_matrix)
+# XGBoost predictions
+test_matrix <- as.matrix(test_data[, -ncol(test_data)])
+pred_xgb <- predict(xgb_model, test_matrix)
   
   predictions <- list(
     rf = pred_rf,
     svm = pred_svm,
     xgb = pred_xgb
   )
-  
-  return(predictions)
-}
-
-# Get predictions
-predictions <- make_predictions(ml_models, xgb_model, test)
 
 
-# ==============================================================================
-# 6. MODEL EVALUATION
-# ==============================================================================
+# 6. MODEL EVALUATION ==============================================================================
 
 evaluate_models <- function(predictions, test_labels) {
-  cat("\n", rep("=", 50), "\n", sep = "")
-  cat("MODEL EVALUATION\n")
-  cat(rep("=", 50), "\n", sep = "")
-  
+
   # Convert labels to numeric (0/1)
   test_numeric <- as.numeric(test_labels) - 1
   
@@ -227,7 +159,7 @@ evaluate_models <- function(predictions, test_labels) {
   auc_svm <- auc(roc_svm)
   auc_xgb <- auc(roc_xgb)
   
-  cat("\nAUC Scores:\n")
+  cat("AUC Scores:\n")
   cat("Random Forest:", round(auc_rf, 4), "\n")
   cat("SVM:", round(auc_svm, 4), "\n")
   cat("XGBoost:", round(auc_xgb, 4), "\n")
@@ -279,11 +211,9 @@ evaluate_models <- function(predictions, test_labels) {
 evaluation_results <- evaluate_models(predictions, test$class)
 
 
-# ==============================================================================
-# 7. VISUALIZATIONS
-# ==============================================================================
+# 7. VISUALIZATIONS ==============================================================================
 
-# 7.1 ROC Curves
+# ROC Curves
 plot_roc_curves <- function(roc_list, metrics) {
   par(pty = "s")
   
@@ -302,7 +232,7 @@ plot_roc_curves <- function(roc_list, metrics) {
 plot_roc_curves(evaluation_results$roc, evaluation_results$metrics)
 
 
-# 7.2 Metrics Comparison Barplot
+# Metrics Comparison Barplot
 plot_metrics_comparison <- function(metrics) {
   library(tidyr)
   
@@ -330,7 +260,7 @@ plot_metrics_comparison <- function(metrics) {
 plot_metrics_comparison(evaluation_results$metrics)
 
 
-# 7.3 Feature Importance (Random Forest)
+# Feature Importance (Random Forest)
 plot_feature_importance <- function(model, top_n = 20) {
   importance_scores <- varImp(model)$importance
   importance_df <- data.frame(
@@ -373,19 +303,13 @@ plot_xgboost_importance <- function(xgb_model, top_n = 20) {
 xgb_importance <- plot_xgboost_importance(xgb_model, top_n = 20)
 
 
-# ==============================================================================
-# 8. DEEP LEARNING WITH H2O
-# ==============================================================================
+# 8. DEEP LEARNING WITH H2O ==============================================================================
 
 train_deep_learning <- function(train_data, validation_data, test_data, 
                                epochs = 100, hidden = c(200, 200, 200)) {
   
-  cat("\n", rep("=", 50), "\n", sep = "")
-  cat("TRAINING DEEP LEARNING MODEL (H2O)\n")
-  cat(rep("=", 50), "\n", sep = "")
-  
   # Initialize H2O
-  h2o.init(nthreads = -1, max_mem_size = "8G")
+  h2o.init(nthreads = -1)
   
   # Convert to H2O frames
   train_h2o <- as.h2o(train_data)
@@ -453,9 +377,8 @@ dl_results <- train_deep_learning(
 cat("\nDeep Learning AUC:", dl_results$auc, "\n")
 
 
-# ==============================================================================
-# 9. FINAL COMPARISON
-# ==============================================================================
+
+# 9. FINAL COMPARISON ==============================================================================
 
 create_final_comparison <- function(ml_metrics, dl_auc) {
   final_metrics <- rbind(
@@ -470,11 +393,6 @@ create_final_comparison <- function(ml_metrics, dl_auc) {
       F1 = NA
     )
   )
-  
-  cat("\n", rep("=", 50), "\n", sep = "")
-  cat("FINAL MODEL COMPARISON\n")
-  cat(rep("=", 50), "\n", sep = "")
-  print(final_metrics)
   
   # Plot AUC comparison
   p <- ggplot(final_metrics, aes(x = reorder(Model, AUC), y = AUC, fill = Model)) +
@@ -500,48 +418,21 @@ final_comparison <- create_final_comparison(
 )
 
 
-# ==============================================================================
-# 10. SAVE RESULTS
-# ==============================================================================
-
-save_results <- function(models, xgb_model, dl_model, metrics, top_genes, 
-                        output_dir = "ml_results") {
+# 10. SAVE RESULTS ==============================================================================
   
-  # Create output directory
-  if(!dir.exists(output_dir)) {
-    dir.create(output_dir, recursive = TRUE)
-  }
-  
-  # Save models
-  saveRDS(models, file.path(output_dir, "ml_models.rds"))
-  saveRDS(xgb_model, file.path(output_dir, "xgb_model.rds"))
-  h2o.saveModel(dl_model, path = output_dir, force = TRUE)
-  
-  # Save metrics
-  write.csv(metrics, file.path(output_dir, "model_metrics.csv"), row.names = FALSE)
-  
-  # Save top genes
-  write.csv(top_genes, file.path(output_dir, "top_important_genes.csv"), row.names = FALSE)
-  
-  cat("\nResults saved to:", output_dir, "\n")
+# Create output directory
+if(!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
 }
+  
+# Save models
+saveRDS(models, file.path(output_dir, "ml_models.rds"))
+saveRDS(xgb_model, file.path(output_dir, "xgb_model.rds"))
+h2o.saveModel(dl_model, path = output_dir, force = TRUE)
+  
+# Save metrics
+write.csv(metrics, file.path(output_dir, "model_metrics.csv"), row.names = FALSE)
+  
+# Save top genes
+write.csv(top_genes, file.path(output_dir, "top_important_genes.csv"), row.names = FALSE)
 
-save_results(
-  models = ml_models,
-  xgb_model = xgb_model,
-  dl_model = dl_results$model,
-  metrics = final_comparison,
-  top_genes = top_genes
-)
-
-
-# ==============================================================================
-# 11. CLEANUP
-# ==============================================================================
-
-# Shutdown H2O
-h2o.shutdown(prompt = FALSE)
-
-cat("\n", rep("=", 50), "\n", sep = "")
-cat("ANALYSIS COMPLETE!\n")
-cat(rep("=", 50), "\n\n", sep = "")
