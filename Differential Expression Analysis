@@ -1,130 +1,445 @@
-
-
-#### Differential analysis using Deseq2 ####
+==============================================================================
+# Load Required Libraries
 library(DESeq2)
 library(dplyr)
 library(EnhancedVolcano)
 library(ggfortify)
-library(ggbio)
 library(plotly)
-library(ComplexHeatmap)  
+library(ComplexHeatmap)
+library(ggplot2)
+library(circlize)
+
+# 1. Sample type filteration & dds creation ==============================================================================
+
+# Filter to include only normal and tumor samples
+samples_to_keep <- phenoData[[shortCodeLetter]] %in% c(normal_label, tumor_label)
+  
+count_data_filtered <- count_data[, samples_to_keep]
+phenoData_filtered <- phenoData[samples_to_keep, ]
+  
+# Set factor levels 
+phenoData_filtered[[shortCodeLetter]] <- factor(
+  phenoData_filtered[[shortCodeLetter]],
+  levels = c('NT', 'TP')
+)
+  
+  
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data_filtered,
+  colData = phenoData_filtered,
+  design = as.formula(paste("~", condition_column))
+)
 
 
-cond1="Solid Tissue Normal" 
-cond2="Primary Tumor"
 
-dds= DESeqDataSetFromMatrix( countData = filtered_data, colData = colData , design = ~ sample_type)
-dds.run = DESeq(dds)
 
-### specifying the contrast
-res=results(dds.run, contrast = c("sample_type",cond2 ,cond1) )
 
-# remove nulls
-res=res[complete.cases(res), ]
-summary(res)
+# 2. RUN DIFFERENTIAL EXPRESSION ANALYSIS ==============================================================================
 
-res.df=as.data.frame(res)
+  dds_run <- DESeq(dds)
+  
+  # Extract results with contrast
+  res <- results(
+    dds_run,
+    contrast = c("sample_type", tumor_label, normal_label),
+    alpha = padj_threshold
+  )
+  
+  # Convert to data frame
+  res_df <- as.data.frame(res)
+  
+  # Identify DEGs
+  degs <- res[res$padj <  0.01 & abs(res$log2FoldChange) > log2(3), ]
+  degs <- degs[order(degs$padj), ]
+  
+  
+  return(list(
+    dds = dds_run,
+    results = res,
+    results_df = res_df,
+    degs = degs,
+    deg_genes = rownames(degs)
+  ))
+}
 
-### DEGs visualization ###
-### Volcano Plot
+
+
+
+# 3. EXPORT DEGs ==============================================================================
+
+# Create output directory
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Export gene list
+  write.table(
+    deg_genes,
+    file = file.path(output_dir, "degs_prostate.txt"),
+    quote = FALSE,
+    col.names = FALSE,
+    row.names = FALSE
+  )
+  
+# Export full DEG results with statistics
+deg_table <- as.data.frame(results)
+deg_table$gene <- rownames(deg_table)
+deg_table <- deg_table[, c("gene", "baseMean", "log2FoldChange", 
+                             "lfcSE", "stat", "pvalue", "padj")]
+  
+write.csv(
+  deg_table,
+  file = file.path(output_dir, "degs_full_results.csv"),
+  row.names = FALSE 
+)
+  
+# Export separate lists for up and down regulated genes
+upregulated <- deg_genes[results[deg_genes, "log2FoldChange"] > 0]
+downregulated <- deg_genes[results[deg_genes, "log2FoldChange"] < 0]
+  
+write.table(
+  upregulated,
+  file = file.path(output_dir, "degs_upregulated.txt"),
+  quote = FALSE,
+  col.names = FALSE,
+  row.names = FALSE
+)
+  
+write.table(
+  downregulated,
+  file = file.path(output_dir, "degs_downregulated.txt"),
+  quote = FALSE,
+  col.names = FALSE,
+  row.names = FALSE
+)
+
+
+# 4. NORMALIZE AND TRANSFORM DATA ==============================================================================
+
+
+
+  ntd <- normTransform(dds)
+  exp_norm <- assay(ntd)
+  
+  # Extract DEG expression
+  degs_exp <- exp_norm[deg_genes, ]
+    
+  return(list(
+    all_normalized = exp_norm,
+    degs_normalized = degs_exp
+  ))
+}
+
+
+# 5. VOLCANO PLOT ==============================================================================
+
+
+create_volcano_plot <- function(results_df, padj_cutoff = 0.01, 
+                               lfc_cutoff = 1.5, output_dir = "plots") {
+  
+
+  
+# Create output directory
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+# Define colors based on significance
 keyvals <- ifelse(
-  res$log2FoldChange < -1.5 & res$padj < 0.01, 'green4',
-  ifelse(res$log2FoldChange > 1.5 & res$padj < 0.01 , 'red3',
-         'black'))
-keyvals[is.na(keyvals)] <- 'black'
-names(keyvals)[keyvals == 'red3'] <- 'high'
-names(keyvals)[keyvals == 'black'] <- 'mid'
-names(keyvals)[keyvals == 'green4'] <- 'low'
+  results_df$log2FoldChange < -lfc_cutoff & results_df$padj < padj_cutoff, "green4",
+  ifelse(results_df$log2FoldChange > lfc_cutoff & results_df$padj < padj_cutoff, "red3",
+          "grey30")
+)
+keyvals[is.na(keyvals)] <- "grey30"
+names(keyvals)[keyvals == "red3"] <- "Upregulated"
+names(keyvals)[keyvals == "grey30"] <- "Not significant"
+names(keyvals)[keyvals == "green4"] <- "Downregulated"
+  
+# Create volcano plot
+p <- EnhancedVolcano(
+  results_df,
+  lab = rownames(results_df),
+  x = "log2FoldChange",
+  y = "padj",
+  title = "Volcano Plot: Primary Tumor vs Normal",
+  subtitle = paste0("padj < ", padj_cutoff, ", |log2FC| > ", lfc_cutoff),
+  colCustom = keyvals,
+  pCutoff = padj_cutoff,
+  FCcutoff = lfc_cutoff,
+  pointSize = 2.0,
+  labSize = 4.0,
+  col = c("grey30", "grey30", "green4", "red3"),
+  colAlpha = 0.7,
+  legendPosition = "right",
+  legendLabSize = 12,
+  legendIconSize = 4.0,
+  drawConnectors = TRUE,
+  widthConnectors = 0.5,
+  max.overlaps = 20
+)
+  
+# Save plot
+ggsave(
+  file.path(output_dir, "volcano_plot.png"),
+  plot = p,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+  
+return(p)
+}
 
-EnhancedVolcano(res.df,
-                lab = rownames(res.df),
-                x = 'log2FoldChange',
-                y = 'padj',
-                colCustom = keyvals,
-                pCutoff =  0.01,
-                FCcutoff = 1.5,
-                pointSize = 2.0,
-                labSize = 6.0,
-                col=c('black', 'black', 'black', 'red3'),
-                colAlpha = 1)
+# Create volcano plot
+volcano_plot <- create_volcano_plot(
+  de_results$results_df,
+  padj_cutoff = 0.01,
+  lfc_cutoff = 1.5
+)
 
-
-### DEGs selection criteria ###
-
-res.degs=res[res$padj< 0.01 & abs(res$log2FoldChange)>log2(3),]
-res.degs=res.degs[order(res.degs$padj), ]
-
-degs.genes=rownames(res.degs)
-
-##export degs for gene enrichment analysis
-write.table(degs.genes, file="degs_prostate.txt", quote = F, col.names = F, row.names = F)
-
-#### get the normalized and logged transformed values of all exp data
-
-
-ntd=normTransform(dds)
-exp.norm= assay(ntd)
-
-
- 
-### get the normalized expression levels of the degs ###################
-degs.exp=exp.norm[degs.genes,]
-
-##creating a heatmap for the top 500 DEG genes
-
-#  get the expression profiles of the top 500 degs only and create heatmap
-sorted_genes <- order(res.degs[,6], decreasing = FALSE)
-
-# Get the top 500 DEGs based on the sorted order
-top_100_degs <- sorted_genes[1:500]
-
-top_100_degs_info <- degs.exp[top_100_degs, ]
-
-phenotable.sub=colData[colData$sample_type %in% c("Primary Tumor", "Solid Tissue Normal"),]
-sample_type_colors <- c("Primary Tumor" = "red", "Solid Tissue Normal" = "green")
-column_ha <- HeatmapAnnotation(Sample.type = phenotable.sub$sample_type, col = list(Sample.type = sample_type_colors))
-Heatmap(t(scale(t(top_100_degs_info))),
-        row_names_gp = gpar(fontsize = 2.5),
-        name = "Z-score",
-        column_names_gp = gpar(fontsize = 6),
-        top_annotation = column_ha,
-        column_split = colData$sample_type)
-
-###creating  2D PCA for all degs and look how it segregates the healthy and tumor samples 
-exp.pca=prcomp(t(degs.exp),scale=T)
-sample_type_colors <- c("Primary Tumor" = "red", "Solid Tissue Normal" = "green3")
-autoplot(exp.pca, data = as.data.frame(colData), colour = 'sample_type', frame = FALSE) +
-  scale_color_manual(values = sample_type_colors)
+print(volcano_plot)
 
 
-###creating  3D PCA  all degs and look how it segregates the healthy and tumor samples 
-exp.pca <- prcomp(t(degs.exp),scale=T)
-exp.pca <- as.data.frame(exp.pca$x)
-exp.pca$class <- colData$sample_type 
-mycolors= rep("green3",dim(colData)[1])
-mycolors[which(colData$sample_type=="Primary Tumor")]="red"
+## 6. HEATMAP OF TOP DEGs ==============================================================================
 
+create_deg_heatmap <- function(degs_exp, degs_results, metadata, 
+                              top_n = 500, output_dir = "plots") {
 
-# Create a 3D PCA plot
-p <- plot_ly(
-  data = exp.pca,
-  x = ~PC1,
-  y = ~PC2,
-  z = ~PC3,
-  color = ~class
-  ,
-  type = 'scatter3d',
-  mode = 'markers',
-  marker = list(size = 5),
-  text = ~paste("PC1:", round(PC1, 2), "<br>PC2:", round(PC2, 2), "<br>PC3:",
-                round(PC3, 2))
-) %>%
-  layout(
-    title = "3D PCA Plot",
-    scene = list(
-      xaxis = list(title = 'Principal Component 1'),
-      yaxis = list(title = 'Principal Component 2'),
-      zaxis = list(title = 'Principal Component 3')
+  # Select top N DEGs based on adjusted p-value
+  top_degs_idx <- order(degs_results$padj)[1:min(top_n, nrow(degs_results))]
+  top_degs_exp <- degs_exp[top_degs_idx, ]
+
+  # Filter metadata for relevant samples
+  metadata_filtered <- phenoData[phenoData$sample_type %in% 
+                                c("Primary Tumor", "Solid Tissue Normal"), ]
+  
+  # Define colors
+  sample_type_colors <- c("Primary Tumor" = "red", "Solid Tissue Normal" = "green")
+  
+  # Create column annotation
+  column_ha <- HeatmapAnnotation(
+    Sample_Type = phenoData_filtered$sample_type,
+    col = list(Sample_Type = sample_type_colors),
+    annotation_name_gp = gpar(fontsize = 10),
+    annotation_legend_param = list(
+      Sample_Type = list(title = "Sample Type")
     )
   )
+  
+  # Z-score normalization
+  mat_scaled <- t(scale(t(top_degs_exp)))
+  
+  # Create heatmap
+  ht <- Heatmap(
+    mat_scaled,
+    name = "Z-score",
+    top_annotation = column_ha,
+    column_split = phenoData_filtered$sample_type,
+    cluster_columns = TRUE,
+    cluster_rows = TRUE,
+    show_row_names = ifelse(nrow(mat_scaled) <= 100, TRUE, FALSE),
+    show_column_names = FALSE,
+    row_names_gp = gpar(fontsize = 6),
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    heatmap_legend_param = list(
+      title = "Expression\n(Z-score)",
+      legend_height = unit(4, "cm")
+    ),
+    col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+    use_raster = TRUE,
+    raster_quality = 2
+  )
+  
+  # Save heatmap
+  png(
+    file.path(output_dir, "deg_heatmap_top500.png"),
+    width = 12,
+    height = 10,
+    units = "in",
+    res = 300
+  )
+  draw(ht)
+  dev.off()
+  
+  cat("Heatmap saved to:", file.path(output_dir, "deg_heatmap_top500.png"), "\n\n")
+  
+  return(ht)
+}
+
+# Create heatmap
+deg_heatmap <- create_deg_heatmap(
+  degs_exp = normalized_data$degs_normalized,
+  degs_results = de_results$degs,
+  metadata = colData,
+  top_n = 500
+)
+
+draw(deg_heatmap)
+
+
+# 7. 2D PCA PLOT ==============================================================================
+
+create_2d_pca <- function(degs_exp, metadata, output_dir = "plots") {
+  
+
+  # Perform PCA
+  pca_result <- prcomp(t(degs_exp), scale. = TRUE)
+  
+  # Calculate variance explained
+  var_explained <- summary(pca_result)$importance[2, 1:2] * 100
+  
+  # Create data frame for plotting
+  pca_df <- as.data.frame(pca_result$x[, 1:2])
+  pca_df$sample_type <- metadata$sample_type
+  
+  # Define colors
+  sample_type_colors <- c("Primary Tumor" = "red", "Solid Tissue Normal" = "green3")
+  
+  # Create plot
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = sample_type)) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_manual(values = sample_type_colors) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right"
+    ) +
+    labs(
+      title = "2D PCA: Primary Tumor vs Normal",
+      x = paste0("PC1 (", round(var_explained[1], 2), "% variance)"),
+      y = paste0("PC2 (", round(var_explained[2], 2), "% variance)"),
+      color = "Sample Type"
+    ) +
+    stat_ellipse(aes(group = sample_type), type = "norm", level = 0.95)
+  
+  # Save plot
+  ggsave(
+    file.path(output_dir, "pca_2d_plot.png"),
+    plot = p,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  
+  return(list(plot = p, pca = pca_result))
+}
+
+# Create 2D PCA
+pca_2d <- create_2d_pca(normalized_data$degs_normalized, colData)
+
+print(pca_2d$plot)
+
+
+# 8. 3D PCA PLOT (INTERACTIVE) ==============================================================================
+
+create_3d_pca <- function(degs_exp, metadata, output_dir = "plots") {
+  
+  # Perform PCA
+  pca_result <- prcomp(t(degs_exp), scale. = TRUE)
+  pca_df <- as.data.frame(pca_result$x[, 1:3])
+  pca_df$sample_type <- metadata$sample_type
+  
+  # Calculate variance explained
+  var_explained <- summary(pca_result)$importance[2, 1:3] * 100
+  
+  # Define colors
+  colors <- ifelse(pca_df$sample_type == "Primary Tumor", "red", "green")
+  
+  # Create 3D plot
+  p <- plot_ly(
+    data = pca_df,
+    x = ~PC1,
+    y = ~PC2,
+    z = ~PC3,
+    color = ~sample_type,
+    colors = c("green", "red"),
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, opacity = 0.7),
+    text = ~paste(
+      "Sample Type:", sample_type,
+      "<br>PC1:", round(PC1, 2),
+      "<br>PC2:", round(PC2, 2),
+      "<br>PC3:", round(PC3, 2)
+    ),
+    hoverinfo = "text"
+  ) %>%
+    layout(
+      title = list(
+        text = "3D PCA Plot: Primary Tumor vs Normal",
+        font = list(size = 16, face = "bold")
+      ),
+      scene = list(
+        xaxis = list(title = paste0("PC1 (", round(var_explained[1], 2), "%)")),
+        yaxis = list(title = paste0("PC2 (", round(var_explained[2], 2), "%)")),
+        zaxis = list(title = paste0("PC3 (", round(var_explained[3], 2), "%)"))
+      ),
+      legend = list(title = list(text = "Sample Type"))
+    )
+  
+  # Save as HTML
+  htmlwidgets::saveWidget(
+    p,
+    file.path(output_dir, "pca_3d_plot.html"),
+    selfcontained = TRUE
+  )
+  return(p)
+}
+
+# Create 3D PCA
+pca_3d <- create_3d_pca(normalized_data$degs_normalized, colData)
+
+pca_3d
+
+
+# 10. SUMMARY REPORT ==============================================================================
+
+generate_summary_report <- function(de_results, output_dir = "results") {
+  
+  cat(rep("=", 70), "\n", sep = "")
+  cat("SUMMARY REPORT\n")
+  cat(rep("=", 70), "\n\n", sep = "")
+  
+  # Create summary statistics
+  summary_stats <- data.frame(
+    Metric = c(
+      "Total genes tested",
+      "Significant DEGs (padj < 0.01, |log2FC| > log2(3))",
+      "Upregulated in tumor",
+      "Downregulated in tumor",
+      "Percentage upregulated",
+      "Percentage downregulated",
+      "Top upregulated gene",
+      "Top downregulated gene"
+    ),
+    Value = c(
+      nrow(de_results$results),
+      nrow(de_results$degs),
+      sum(de_results$degs$log2FoldChange > 0),
+      sum(de_results$degs$log2FoldChange < 0),
+      paste0(round(100 * sum(de_results$degs$log2FoldChange > 0) / nrow(de_results$degs), 2), "%"),
+      paste0(round(100 * sum(de_results$degs$log2FoldChange < 0) / nrow(de_results$degs), 2), "%"),
+      rownames(de_results$degs)[which.max(de_results$degs$log2FoldChange)],
+      rownames(de_results$degs)[which.min(de_results$degs$log2FoldChange)]
+    )
+  )
+  
+  # Save summary
+  write.csv(
+    summary_stats,
+    file.path(output_dir, "analysis_summary.csv"),
+    row.names = FALSE
+  )
+  
+  # Print summary
+  cat("Analysis Summary:\n")
+  print(summary_stats, row.names = FALSE)
+  cat("\n")
+  
+  cat("Summary saved to:", file.path(output_dir, "analysis_summary.csv"), "\n\n")
+  
+  return(summary_stats)
+}
+
+# Generate summary report
+summary_report <- generate_summary_report(de_results)
+
 
